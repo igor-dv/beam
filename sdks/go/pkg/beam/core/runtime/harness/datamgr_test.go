@@ -18,6 +18,7 @@ package harness
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -540,6 +541,43 @@ func TestDataChannelTerminate_Writes(t *testing.T) {
 				t.Fatal("context wasn't cancelled")
 			}
 		})
+	}
+}
+
+type failLastClient struct{ block chan struct{} }
+
+func (f *failLastClient) Recv() (*fnpb.Elements, error) { <-f.block; return nil, io.EOF }
+func (f *failLastClient) Send(e *fnpb.Elements) error {
+	for _, d := range e.GetData() {
+		if d.GetIsLast() {
+			return errors.New("Unavailable")
+		}
+	}
+	for _, tm := range e.GetTimers() {
+		if tm.GetIsLast() {
+			return errors.New("Unavailable")
+		}
+	}
+	return nil
+}
+
+func TestDataWriter_Close(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	client := &failLastClient{block: make(chan struct{})}
+	defer close(client.block)
+	c := makeDataChannel(ctx, "id", client, cancel)
+
+	w := c.OpenWrite(ctx, "ptr", "inst1")
+	if _, err := w.Write([]byte("element")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err == nil || !strings.Contains(err.Error(), "dataWriter[") {
+		t.Fatalf("Close = %v, want dataWriter attribution", err)
+	}
+	tw := c.OpenTimerWrite(ctx, "ptr", "inst2", "family")
+	if err := tw.Close(); err == nil || !strings.Contains(err.Error(), "timerWriter[") {
+		t.Fatalf("timer Close = %v, want timerWriter attribution", err)
 	}
 }
 

@@ -51,6 +51,11 @@ const URNMonitoringInfoShortID = "beam:protocol:monitoring_info_short_ids:v1"
 type Options struct {
 	RunnerCapabilities []string // URNs for what runners are able to understand over the FnAPI.
 	StatusEndpoint     string   // Endpoint for worker status reporting.
+
+	// PlanGeneration maps a process-bundle descriptor id to a generation.
+	// A new non-empty generation drops idle plans and descriptors from other generations.
+	// Nil never evicts.
+	PlanGeneration func(descriptorID string) string
 }
 
 // Main is the main entrypoint for the Go harness. It runs at "runtime" -- not
@@ -163,6 +168,7 @@ func MainWithOptions(ctx context.Context, loggingEndpoint, controlEndpoint strin
 		cache:                &sideCache,
 		runnerCapabilities:   rcMap,
 		elmTimeout:           elmTimeout,
+		planGeneration:       opts.PlanGeneration,
 	}
 
 	if enabled, ok := rcMap[graphx.URNDataSampling]; ok && enabled {
@@ -297,7 +303,9 @@ type control struct {
 
 	descriptors map[bundleDescriptorID]*fnpb.ProcessBundleDescriptor // protected by mu
 	// plans that are candidates for execution.
-	plans map[bundleDescriptorID][]*exec.Plan // protected by mu
+	plans          map[bundleDescriptorID][]*exec.Plan // protected by mu
+	planGeneration func(string) string
+	generation     string // protected by mu
 	// plans that are awaiting bundle finalization.
 	awaitingFinalization map[instructionID]awaitingFinalization //protected by mu
 	// plans that are actively being executed.
@@ -329,6 +337,65 @@ func (c *control) metStoreToString(statusInfo *strings.Builder) {
 		statusInfo.WriteString(fmt.Sprintf("\t%s", store.BundleState()))
 		statusInfo.WriteString(fmt.Sprintf("\t%s", store.StateRegistry()))
 	}
+}
+
+func (c *control) generationOf(id bundleDescriptorID) string {
+	if c.planGeneration == nil {
+		return ""
+	}
+	return c.planGeneration(string(id))
+}
+
+// setGeneration records the current plan generation. A new non-empty generation
+// drops idle plans and descriptors of other generations.
+func (c *control) setGeneration(gen string) {
+	if gen == "" {
+		return
+	}
+	c.mu.Lock()
+	if c.generation == gen {
+		c.mu.Unlock()
+		return
+	}
+	c.generation = gen
+	var stale []*exec.Plan
+	for id, plans := range c.plans {
+		if g := c.generationOf(id); g != "" && g != gen {
+			stale = append(stale, plans...)
+			delete(c.plans, id)
+		}
+	}
+	for id := range c.descriptors {
+		if g := c.generationOf(id); g != "" && g != gen {
+			delete(c.descriptors, id)
+		}
+	}
+	c.mu.Unlock()
+	downPlans(stale...)
+}
+
+// returnPlan pools a finished plan, or tears it down if its generation is stale.
+// Caller holds c.mu.
+func (c *control) returnPlan(id bundleDescriptorID, plan *exec.Plan) {
+	if g := c.generationOf(id); g != "" && c.generation != "" && g != c.generation {
+		downPlans(plan)
+		return
+	}
+	c.plans[id] = append(c.plans[id], plan)
+}
+
+func downPlans(plans ...*exec.Plan) {
+	if len(plans) == 0 {
+		return
+	}
+	go func() {
+		ctx := context.Background()
+		for _, p := range plans {
+			if err := p.Down(ctx); err != nil {
+				log.Warnf(ctx, "plan.Down: %v", err)
+			}
+		}
+	}()
 }
 
 func (c *control) getOrCreatePlan(bdID bundleDescriptorID) (*exec.Plan, error) {
@@ -396,6 +463,7 @@ func (c *control) handleInstruction(ctx context.Context, req *fnpb.InstructionRe
 
 		// TODO(lostluck): 2023/03/29 fix debug level logging to be flagged.
 		// log.Debugf(ctx, "PB [%v]: %v", instID, msg)
+		c.setGeneration(c.generationOf(bdID))
 		plan, err := c.getOrCreatePlan(bdID)
 
 		// Make the plan active.
@@ -466,12 +534,12 @@ func (c *control) handleInstruction(ctx context.Context, req *fnpb.InstructionRe
 				// Move any plans that have exceeded their expiration back into the re-use pool
 				for id, af := range c.awaitingFinalization {
 					if time.Now().After(af.expiration) {
-						c.plans[af.bdID] = append(c.plans[af.bdID], af.plan)
+						c.returnPlan(af.bdID, af.plan)
 						delete(c.awaitingFinalization, id)
 					}
 				}
 			} else {
-				c.plans[bdID] = append(c.plans[bdID], plan)
+				c.returnPlan(bdID, plan)
 			}
 		}
 
@@ -530,8 +598,10 @@ func (c *control) handleInstruction(ctx context.Context, req *fnpb.InstructionRe
 				return fail(ctx, instID, "finalize bundle failed for instruction %v using plan %v : %v", ref, af.bdID, err)
 			}
 		}
-		c.plans[af.bdID] = append(c.plans[af.bdID], af.plan)
+		c.mu.Lock()
+		c.returnPlan(af.bdID, af.plan)
 		delete(c.awaitingFinalization, ref)
+		c.mu.Unlock()
 
 		return &fnpb.InstructionResponse{
 			InstructionId: string(instID),

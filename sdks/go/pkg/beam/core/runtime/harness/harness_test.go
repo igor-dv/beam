@@ -19,6 +19,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -256,5 +257,111 @@ func TestElementProcessingTimeoutParsing(t *testing.T) {
 		if got != test.want {
 			t.Errorf("parseTimeoutDurationFlag(ctx, %q) = %v, want %v", test.in, got, test.want)
 		}
+	}
+}
+
+type downCounter struct{ downs *atomic.Int32 }
+
+func (d downCounter) ID() exec.UnitID { return 1 }
+func (d downCounter) Up(context.Context) error {
+	return nil
+}
+func (d downCounter) StartBundle(context.Context, string, exec.DataContext) error { return nil }
+func (d downCounter) FinishBundle(context.Context) error                          { return nil }
+func (d downCounter) Down(context.Context) error                                  { d.downs.Add(1); return nil }
+func (d downCounter) Process(context.Context) ([]*exec.Checkpoint, error)         { return nil, nil }
+
+func countedPlan(t *testing.T, id string, downs *atomic.Int32) *exec.Plan {
+	t.Helper()
+	p, err := exec.NewPlan(id, []exec.Unit{downCounter{downs}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// colonGen is a test PlanGeneration: "gen:desc" → "gen", anything else → "".
+func colonGen(id string) string {
+	s, _, ok := strings.Cut(id, ":")
+	if !ok {
+		return ""
+	}
+	return s
+}
+
+func TestControl_setGeneration(t *testing.T) {
+	var downs atomic.Int32
+	c := &control{
+		planGeneration: colonGen,
+		descriptors: map[bundleDescriptorID]*fnpb.ProcessBundleDescriptor{
+			"a:stage-1": {Id: "a:stage-1"},
+		},
+		plans: map[bundleDescriptorID][]*exec.Plan{
+			"a:stage-1": {countedPlan(t, "a:stage-1", &downs)},
+		},
+	}
+	c.setGeneration(c.generationOf("a:stage-1"))
+	straggler := countedPlan(t, "a:stage-1", &downs)
+	c.setGeneration(c.generationOf("b:stage-1"))
+
+	c.mu.Lock()
+	_, desc := c.descriptors["a:stage-1"]
+	_, pooled := c.plans["a:stage-1"]
+	c.mu.Unlock()
+	if desc || pooled {
+		t.Fatalf("previous generation still cached (descriptor=%v plans=%v)", desc, pooled)
+	}
+	c.mu.Lock()
+	c.returnPlan("a:stage-1", straggler)
+	_, pooled = c.plans["a:stage-1"]
+	c.mu.Unlock()
+	if pooled {
+		t.Fatal("stale plan was pooled")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for downs.Load() < 2 {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d of 2 plans torn down", downs.Load())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestControl_setGeneration_empty(t *testing.T) {
+	var downs atomic.Int32
+	c := &control{
+		planGeneration: colonGen,
+		descriptors:    map[bundleDescriptorID]*fnpb.ProcessBundleDescriptor{"stage-1": {Id: "stage-1"}},
+		plans:          map[bundleDescriptorID][]*exec.Plan{"stage-1": {countedPlan(t, "stage-1", &downs)}},
+	}
+	c.setGeneration(c.generationOf("stage-1"))
+	c.mu.Lock()
+	c.returnPlan("stage-1", countedPlan(t, "stage-1", &downs))
+	n := len(c.plans["stage-1"])
+	c.mu.Unlock()
+	if n != 2 || downs.Load() != 0 {
+		t.Fatalf("empty-key plan dropped (%d pooled, %d down)", n, downs.Load())
+	}
+}
+
+func TestControl_setGeneration_nil(t *testing.T) {
+	var downs atomic.Int32
+	c := &control{
+		descriptors: map[bundleDescriptorID]*fnpb.ProcessBundleDescriptor{
+			"a:stage-1": {Id: "a:stage-1"},
+		},
+		plans: map[bundleDescriptorID][]*exec.Plan{
+			"a:stage-1": {countedPlan(t, "a:stage-1", &downs)},
+		},
+	}
+	c.setGeneration("b")
+	c.mu.Lock()
+	_, desc := c.descriptors["a:stage-1"]
+	_, pooled := c.plans["a:stage-1"]
+	c.returnPlan("a:stage-1", countedPlan(t, "a:stage-1", &downs))
+	n := len(c.plans["a:stage-1"])
+	c.mu.Unlock()
+	if !desc || !pooled || n != 2 || downs.Load() != 0 {
+		t.Fatalf("nil PlanGeneration evicted (descriptor=%v pooled=%v n=%d downs=%d)", desc, pooled, n, downs.Load())
 	}
 }

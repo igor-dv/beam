@@ -121,7 +121,7 @@ func (m *DataChannelManager) Open(ctx context.Context, port exec.Port) (*DataCha
 	if m.ports == nil {
 		m.ports = make(map[string]*DataChannel)
 	}
-	if con, ok := m.ports[port.URL]; ok {
+	if con, ok := m.ports[port.URL]; ok && !con.dead.Load() {
 		return con, nil
 	}
 
@@ -219,6 +219,8 @@ type DataChannel struct {
 	forceRecreate func(id string, err error)
 	cancelFn      context.CancelFunc // Allows writers to stop the grpc reading goroutine.
 
+	dead atomic.Bool // stream failed; Open must not reuse this channel
+
 	mu sync.Mutex // guards mutable internal data, notably the maps and readErr.
 }
 
@@ -310,6 +312,7 @@ func makeDataChannel(ctx context.Context, id string, client dataClient, cancelFn
 
 // terminateStreamOnError requires the lock to be held.
 func (c *DataChannel) terminateStreamOnError(err error) {
+	c.dead.Store(true)
 	c.cancelFn() // A context.CancelFunc is threadsafe and indempotent.
 	if c.forceRecreate != nil {
 		c.forceRecreate(c.id, err)

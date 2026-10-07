@@ -709,6 +709,45 @@ func TestDataChannelTerminate_recreate(t *testing.T) {
 	}
 }
 
+// Open must not return a channel whose stream has already failed, even if
+// recreate has not dropped it from the port map yet.
+func TestDataChannelOpen_skipsFailedChannel(t *testing.T) {
+	hs := newHoldDataServer()
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gs := grpc.NewServer()
+	fnpb.RegisterBeamFnDataServer(gs, hs)
+	go gs.Serve(lis)
+	defer gs.Stop()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	m := &DataChannelManager{}
+	port := exec.Port{URL: lis.Addr().String()}
+	ch1, err := m.Open(ctx, port)
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-hs.entered
+	ch1.forceRecreate = nil // leave it in the map; Open must still skip it
+	ch1.mu.Lock()
+	ch1.terminateStreamOnError(io.EOF)
+	ch1.mu.Unlock()
+	if !ch1.dead.Load() {
+		t.Fatal("failed stream was not marked dead")
+	}
+
+	ch2, err := m.Open(ctx, port)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ch2 == ch1 {
+		t.Fatal("Open returned a failed channel")
+	}
+}
+
 type holdDataServer struct {
 	fnpb.UnimplementedBeamFnDataServer
 	entered chan struct{}
